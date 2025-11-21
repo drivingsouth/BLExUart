@@ -7,12 +7,14 @@
 #include <BLE2902.h>
 
 #include <Adafruit_NeoPixel.h>
+#include <esp_mac.h>
 
 #define BUFFER 64
 
 /*
-Serial  : Connector "COM" on ESP32-S3 board
+Serial  : Connector "COM" on ESP32-S3 board, CDC on ESP32-C3
 Serial1 : U1TxD(GPIO16),U1RxD(GPIO15) on ESP32-S3 board
+          U0TxD(GPIO21),U0RxD(GPIO20) on ESP32-C3 Super mini board
 */
 
 BLEServer *pServer = NULL;
@@ -28,15 +30,28 @@ uint8_t txValue1[BUFFER] = "";
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
+#if CONFIG_IDF_TARGET_ESP32S3
+#define BLE_DEVICE_NAME "BLE<->UART S3"
+#define ENABLE_PIXEL_LED true
+#elif CONFIG_IDF_TARGET_ESP32C3
+#define BLE_DEVICE_NAME "BLE<->UART C3"
+#define ENABLE_PIXEL_LED false
+#else
+#define BLE_DEVICE_NAME "BLE<->UART"
+#define ENABLE_PIXEL_LED false
+#endif
+
 // Button
 #define BUTTON 0  //タクトスイッチ Boot
+#define BUTTON_OFF 0
+#define BUTTON_ON 1
 uint8_t key_code;
 int old_button_status = 1;
 uint32_t button_detect_count;
 
 // NeoPixel
-#define DIN_PIN 48     // NeoPixel　の出力ピン番号
-#define LED_COUNT 1    // LEDの連結数
+#define DIN_PIN 48    // NeoPixel　の出力ピン番号
+#define LED_COUNT 1   // LEDの連結数
 #define BRIGHTNESS 8  // 輝度
 Adafruit_NeoPixel pixels(LED_COUNT, DIN_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -54,6 +69,9 @@ typedef enum {
 uint8_t pixel_color;
 uint8_t old_pixel_color;
 
+// Connect LED
+#define PIN_CONNECT_LED 8
+
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     deviceConnected = true;
@@ -70,7 +88,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 
     if (rxValue.length() > 0) {
       for (int i = 0; i < rxValue.length(); i++) {
-        Serial.print(rxValue[i]);   // BLE to COM
+        Serial.print(rxValue[i]);  // BLE to COM
         Serial1.print(rxValue[i]);  // BLE to Uart1
       }
     }
@@ -80,13 +98,41 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 void setup_button() {
   pinMode(BUTTON, INPUT_PULLUP);  //プルダウンで入力
 }
+
+// #elif CONFIG_IDF_TARGET_ESP32C3
+// #define RX1 (gpio_num_t)18	= USBD N
+
+// #elif CONFIG_IDF_TARGET_ESP32C3
+// #define TX1 (gpio_num_t)19	= USBD P
+
+// #elif CONFIG_IDF_TARGET_ESP32C3
+// #define SOC_RX0 (gpio_num_t)20	= U0RxD
+
+// #elif CONFIG_IDF_TARGET_ESP32C3
+// #define SOC_TX0 (gpio_num_t)21	= U0TxD
+
 void setup_uart() {
+#if CONFIG_IDF_TARGET_ESP32S3
   Serial.begin(9600);
-  Serial1.begin(9600,SERIAL_8N1, 15,16);
+  Serial1.begin(9600, SERIAL_8N1, RX1, TX1);
+#elif CONFIG_IDF_TARGET_ESP32C3
+  Serial.begin(9600);
+  Serial1.begin(9600, SERIAL_8N1, SOC_RX0, SOC_TX0);
+#endif
 }
 void setup_BLE() {
+  uint8_t mac_value[7] = {0};
+  String device_name = BLE_DEVICE_NAME;
+
+  esp_err_t err = esp_read_mac(mac_value,ESP_MAC_BT);
+  if(err == ESP_OK){
+    char mac_str[6] = {0};
+    sprintf(mac_str,"_%02X%02X", mac_value[4],mac_value[5]);
+    device_name += (String)mac_str;
+  }
+
   // Create the BLE Device
-  BLEDevice::init("BLE<->UART");
+  BLEDevice::init(device_name);
 
   // Create the BLE Server
   pServer = BLEDevice::createServer();
@@ -111,9 +157,28 @@ void setup_BLE() {
   pServer->getAdvertising()->start();
 }
 void setup_neopixel() {
+#if ENABLE_PIXEL_LED
   pixels.begin();  //NeoPixel
   pixels.clear();
   set_pix_color(pixel_color);
+#endif
+}
+
+void connect_led_on() {
+#if CONFIG_IDF_TARGET_ESP32C3
+  digitalWrite(PIN_CONNECT_LED, LOW);
+#endif
+}
+void connect_led_off() {
+#if CONFIG_IDF_TARGET_ESP32C3
+  digitalWrite(PIN_CONNECT_LED, HIGH);
+#endif
+}
+void setup_connect_led() {
+#if CONFIG_IDF_TARGET_ESP32C3
+  pinMode(PIN_CONNECT_LED, OUTPUT_OPEN_DRAIN);
+  connect_led_off();
+#endif
 }
 
 void setup() {
@@ -122,12 +187,12 @@ void setup() {
   setup_uart();
   setup_BLE();
   setup_neopixel();
-
-  Serial.println("Waiting a client connection to notify...");
+  setup_connect_led();
 }
 
 void observe_disconnected() {
   if (!deviceConnected && oldDeviceConnected) {
+    connect_led_off();
     delay(500);                   // give the bluetooth stack the chance to get things ready
     pServer->startAdvertising();  // restart advertising
     oldDeviceConnected = deviceConnected;
@@ -135,6 +200,7 @@ void observe_disconnected() {
 }
 void observe_connected() {
   if (deviceConnected && !oldDeviceConnected) {
+    connect_led_on();
     // do stuff here on connecting
     oldDeviceConnected = deviceConnected;
   }
@@ -142,12 +208,13 @@ void observe_connected() {
 void observe_uart_received() {
   if (deviceConnected == true) {
     if (Serial.available() != 0) {
-      // COM to BLE
+      // USB to BLE
       size_t bufSize = Serial.read(txValue0, Serial.available());
       pTxCharacteristic->setValue(txValue0, bufSize);
       pTxCharacteristic->notify();
       delay(10);  // bluetooth stack will go into congestion, if too many packets are sent
     }
+
     if (Serial1.available() != 0) {
       // Uart1 to BLE
       size_t bufSize1 = Serial1.read(txValue1, Serial1.available());
@@ -158,8 +225,6 @@ void observe_uart_received() {
   }
 }
 
-#define BUTTON_OFF 0
-#define BUTTON_ON 1
 void observe_button() {
   int button_status = digitalRead(BUTTON);
 
@@ -184,6 +249,7 @@ void observe_button() {
 }
 
 void set_pix_color(uint8_t color) {
+#if ENABLE_PIXEL_LED
   switch (color) {
     case PIX_RED:
       pixels.setPixelColor(0, pixels.Color(BRIGHTNESS, 0, 0));
@@ -215,6 +281,7 @@ void set_pix_color(uint8_t color) {
       pixels.show();
       break;
   }
+#endif
 }
 void update_baudrate(uint8_t color) {
   switch (color) {
